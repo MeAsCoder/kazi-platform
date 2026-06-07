@@ -2,6 +2,9 @@ import type { Metadata } from "next";
 import { Bricolage_Grotesque, Hanken_Grotesk } from "next/font/google";
 import "./globals.css";
 
+import { Providers } from "./providers";
+import { OfflineBanner } from "@/components/OfflineBanner";
+
 const display = Bricolage_Grotesque({
   subsets: ["latin"],
   variable: "--font-display",
@@ -22,7 +25,10 @@ export const metadata: Metadata = {
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${display.variable} ${sans.variable}`}>
-      <body className="font-sans antialiased min-h-screen">{children}</body>
+      <body className="font-sans antialiased min-h-screen">
+        <OfflineBanner />
+        <Providers>{children}</Providers>
+      </body>
     </html>
   );
 }

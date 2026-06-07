@@ -50,6 +50,30 @@ export function BanButton({ id, banned }: { id: string; banned: boolean }) {
   );
 }
 
+export function VerifyButton({ id, verified }: { id: string; verified: boolean }) {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  async function toggle() {
+    setBusy(true);
+    await fetch(`/api/admin/users/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ isVerified: !verified }),
+    });
+    router.refresh();
+    setBusy(false);
+  }
+  return (
+    <button
+      className={`text-sm font-medium ${verified ? "text-muted" : "text-acacia"} hover:underline`}
+      disabled={busy}
+      onClick={toggle}
+    >
+      {verified ? "Unverify" : "Verify"}
+    </button>
+  );
+}
+
 export function ScanButton() {
   const router = useRouter();
   const [busy, setBusy] = useState(false);
@@ -60,7 +84,7 @@ export function ScanButton() {
     setBusy(false);
   }
   return (
-    <button className="btn-ghost text-sm" disabled={busy} onClick={scan}>
+    <button className="btn-primary text-sm" disabled={busy} onClick={scan}>
       {busy ? "Scanning…" : "Run fraud scan"}
     </button>
   );
