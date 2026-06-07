@@ -1,0 +1,150 @@
+// Kazi Connect — database schema (PostgreSQL / Neon)
+// Three roles share one User table; profile data hangs off it.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")       // pooled connection (runtime)
+  directUrl = env("DIRECT_URL")         // unpooled (migrations / seeding)
+}
+
+enum Role {
+  WORKER
+  CLIENT
+  ADMIN
+}
+
+enum JobStatus {
+  OPEN
+  MATCHED
+  COMPLETED
+  CANCELLED
+}
+
+enum FlagStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  phone        String   @unique
+  email        String?  @unique
+  passwordHash String
+  role         Role     @default(CLIENT)
+  isBanned     Boolean  @default(false)
+  createdAt    DateTime @default(now())
+
+  // neighborhood + coords used for distance scoring
+  neighborhood String?
+  lat          Float?
+  lng          Float?
+
+  workerProfile WorkerProfile?
+  jobs          Job[]          @relation("ClientJobs")
+  reviewsGiven  Review[]       @relation("ReviewAuthor")
+  fraudFlags    FraudFlag[]    @relation("FlaggedUser")
+}
+
+model WorkerProfile {
+  id              String   @id @default(cuid())
+  userId          String   @unique
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  trade           String                       // e.g. "plumber" (matches model classes)
+  skills          String                       // free text: "leak repair, drainage..."
+  bio             String?
+  experienceYears Int      @default(0)
+  hourlyRate      Int      @default(0)          // KES
+  isAvailable     Boolean  @default(true)
+  availableDays   String[] @default([])         // ["Mon","Tue",...]
+
+  avgRating       Float    @default(0)
+  ratingCount     Int      @default(0)
+  jobsCompleted   Int      @default(0)
+  jobsAccepted    Int      @default(0)
+  isVerified      Boolean  @default(false)
+
+  matches Match[]
+  reviews Review[] @relation("ReviewedWorker")
+
+  @@index([trade])
+}
+
+model Job {
+  id           String    @id @default(cuid())
+  clientId     String
+  client       User      @relation("ClientJobs", fields: [clientId], references: [id], onDelete: Cascade)
+
+  title        String
+  description  String
+  neighborhood String
+  lat          Float
+  lng          Float
+  requiredDate DateTime
+  status       JobStatus @default(OPEN)
+
+  predictedTrade String?  // cached from the model service
+  createdAt      DateTime @default(now())
+
+  matches Match[]
+  reviews Review[]
+
+  @@index([status])
+  @@index([predictedTrade])
+}
+
+model Match {
+  id             String        @id @default(cuid())
+  jobId          String
+  job            Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  workerId       String
+  worker         WorkerProfile @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  score          Float
+  scoreBreakdown Json
+  rank           Int
+  createdAt      DateTime      @default(now())
+
+  review Review?
+
+  @@unique([jobId, workerId])
+  @@index([jobId])
+}
+
+model Review {
+  id         String        @id @default(cuid())
+  matchId    String        @unique
+  match      Match         @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  jobId      String
+  job        Job           @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  workerId   String
+  worker     WorkerProfile @relation("ReviewedWorker", fields: [workerId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     User          @relation("ReviewAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+
+  stars      Int
+  comment    String?
+  createdAt  DateTime      @default(now())
+
+  @@index([workerId])
+}
+
+model FraudFlag {
+  id          String     @id @default(cuid())
+  userId      String
+  user        User       @relation("FlaggedUser", fields: [userId], references: [id], onDelete: Cascade)
+  reason      String
+  severity    String     @default("medium")  // low | medium | high
+  details     Json?
+  reportedBy  String     @default("system")  // "system" or a user id
+  status      FlagStatus @default(OPEN)
+  createdAt   DateTime   @default(now())
+
+  @@index([status])
+}
