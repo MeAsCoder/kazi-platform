@@ -7,6 +7,18 @@ ranking and business logic live in the Next.js app; this service does ML only.
 Endpoints:
   GET  /health         -> liveness + which model is loaded
   POST /predict-trade  -> {text} -> {trade, confidence, ambiguous, alternatives, ranked}
+
+Confidence & alternatives notes
+--------------------------------
+The classifier is a LinearSVC, whose ``decision_function`` returns raw margins, not
+probabilities. We therefore:
+  * convert margins to a relative confidence with a softmax (well-behaved, sums to 1);
+  * only ever surface an alternative trade when it is *genuinely close* to the top
+    prediction (within ALT_MARGIN), capped at one, so we never show unrelated trades;
+  * flag a prediction as ambiguous only when the top two trades are close AND a real
+    alternative exists.
+If the loaded model exposes ``predict_proba`` (e.g. a calibrated classifier), we use
+that directly instead of the softmax-over-margins approximation.
 """
 import os
 import random
@@ -54,8 +66,13 @@ TRADE_VOCAB = {
                "pick up luggage", "moving to a new house"],
 }
 
-AMBIGUITY_GAP = 0.6
-AMBIGUITY_CONF = 0.6
+# ---------------------------------------------------------------- tunables
+# These are calibrated against the LinearSVC margin scale. Inspect the `gap` and
+# `ranked` scores from a few real requests and nudge if needed.
+ALT_MARGIN = 0.8      # a runner-up only counts as an alternative if within this of the top score
+AMBIGUITY_GAP = 0.8   # below this top-vs-2nd margin gap we treat the prediction as ambiguous
+ALT_PROBA_MARGIN = 0.15  # used instead when the model exposes predict_proba (probabilities)
+
 _MODEL = None
 
 
@@ -102,12 +119,56 @@ def _load_model():
     return _MODEL
 
 
+def _class_labels(model):
+    """Class labels whether the final step is a bare or calibrated classifier."""
+    try:
+        return model.named_steps["clf"].classes_
+    except (KeyError, AttributeError):
+        return model.classes_
+
+
+def _score(model, cleaned):
+    """Return (labels, order, confidence, ranked, alternatives, gap).
+
+    Uses real probabilities when available (predict_proba), otherwise a softmax over
+    the LinearSVC decision-function margins. Alternatives are only included when they
+    are genuinely close to the top prediction.
+    """
+    labels = _class_labels(model)
+
+    if hasattr(model, "predict_proba"):
+        probs = np.asarray(model.predict_proba([cleaned])[0], dtype=float)
+        order = np.argsort(probs)[::-1]
+        conf = float(probs[order[0]])
+        ranked = [{"trade": str(labels[i]), "score": round(float(probs[i]), 3)} for i in order]
+        top = float(probs[order[0]])
+        gap = top - (float(probs[order[1]]) if len(order) > 1 else 0.0)
+        alternatives = [str(labels[i]) for i in order[1:]
+                        if (top - float(probs[i])) <= ALT_PROBA_MARGIN][:1]
+        return labels, order, conf, ranked, alternatives, gap
+
+    # bare LinearSVC: raw margins
+    scores = np.asarray(model.decision_function([cleaned])[0], dtype=float)
+    order = np.argsort(scores)[::-1]
+    top = float(scores[order[0]])
+    second = float(scores[order[1]]) if len(order) > 1 else top - 99.0
+    gap = top - second
+    # softmax over margins -> relative, well-behaved confidence
+    exp = np.exp(scores - np.max(scores))
+    probs = exp / exp.sum()
+    conf = float(probs[order[0]])
+    ranked = [{"trade": str(labels[i]), "score": round(float(scores[i]), 3)} for i in order]
+    alternatives = [str(labels[i]) for i in order[1:]
+                    if (top - float(scores[i])) <= ALT_MARGIN][:1]
+    return labels, order, conf, ranked, alternatives, gap
+
+
 # ---------------------------------------------------------------- API
 class PredictIn(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
-app = FastAPI(title="Kazi Connect Model Service", version="1.0.0")
+app = FastAPI(title="Kazi Connect Model Service", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -134,13 +195,17 @@ def predict_trade(payload: PredictIn):
     model = _load_model()
     cleaned = _clean(payload.text)
     pred = str(model.predict([cleaned])[0])
-    scores = model.decision_function([cleaned])[0]
-    classes = model.named_steps["clf"].classes_
-    order = np.argsort(scores)[::-1]
-    conf = float(1 / (1 + np.exp(-scores[order[0]])))
-    ranked = [{"trade": str(classes[i]), "score": round(float(scores[i]), 3)} for i in order]
-    gap = float(scores[order[0]] - scores[order[1]]) if len(order) > 1 else 99.0
-    ambiguous = bool(conf < AMBIGUITY_CONF or gap < AMBIGUITY_GAP)
-    return {"trade": pred, "confidence": round(conf, 3), "ambiguous": ambiguous,
-            "gap": round(gap, 3), "alternatives": [r["trade"] for r in ranked[1:3]],
-            "ranked": ranked}
+
+    labels, order, conf, ranked, alternatives, gap = _score(model, cleaned)
+
+    # Ambiguous only when the top two are close AND a genuine alternative exists.
+    ambiguous = bool(gap < AMBIGUITY_GAP and len(alternatives) > 0)
+
+    return {
+        "trade": pred,
+        "confidence": round(conf, 3),
+        "ambiguous": ambiguous,
+        "gap": round(gap, 3),
+        "alternatives": alternatives,
+        "ranked": ranked,
+    }
