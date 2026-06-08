@@ -5,7 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-# Commit your trained trade_classifier.joblib alongside main.py to use it;
-# otherwise the service trains the synthetic fallback on startup.
+# The trained multi-label model (trade_classifier.joblib) is copied in by `COPY . .`
+# above, so the service loads it on startup. If it were missing, main.py trains a
+# synthetic fallback instead.
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]

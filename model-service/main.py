@@ -1,24 +1,22 @@
 """Kazi Connect — model service.
 
 The ONLY Python component in production. Exposes the trained trade classifier over
-HTTP so the Next.js app can predict a trade from a free-text job request. All data,
-ranking and business logic live in the Next.js app; this service does ML only.
+HTTP so the Next.js app can predict the trade(s) from a free-text job request. All
+data, ranking and business logic live in the Next.js app; this service does ML only.
 
 Endpoints:
   GET  /health         -> liveness + which model is loaded
-  POST /predict-trade  -> {text} -> {trade, confidence, ambiguous, alternatives, ranked}
+  POST /predict-trade  -> {text} -> {trade, trades, confidence, ambiguous, alternatives, ranked}
 
-Confidence & alternatives notes
---------------------------------
-The classifier is a LinearSVC, whose ``decision_function`` returns raw margins, not
-probabilities. We therefore:
-  * convert margins to a relative confidence with a softmax (well-behaved, sums to 1);
-  * only ever surface an alternative trade when it is *genuinely close* to the top
-    prediction (within ALT_MARGIN), capped at one, so we never show unrelated trades;
-  * flag a prediction as ambiguous only when the top two trades are close AND a real
-    alternative exists.
-If the loaded model exposes ``predict_proba`` (e.g. a calibrated classifier), we use
-that directly instead of the softmax-over-margins approximation.
+Model formats supported
+-----------------------
+1. MULTI-LABEL (current): artifact is a dict
+     {"pipeline": <Pipeline with predict_proba>, "labels": [...], "multilabel": True}
+   A request can map to several trades (e.g. "fix my appliances and my shower head" ->
+   electrician + plumber). We return the primary trade plus any co-trades above
+   threshold. Probabilities are calibrated, so confidence is meaningful.
+2. LEGACY single-label: artifact is a bare fitted Pipeline (LinearSVC). Kept working
+   so an old joblib still loads; uses a softmax over margins and a closeness filter.
 """
 import os
 import random
@@ -30,48 +28,26 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------- vocabulary
-# Single source of truth for the synthetic trades corpus (mirrors train.py).
+# ---------------------------------------------------------------- vocabulary (fallback only)
 TRADE_VOCAB = {
     "plumber": ["leaking pipe", "fix the tap", "blocked drainage", "burst pipe",
-                "install water tank", "sink not draining", "toilet repair", "no water",
-                "water heater not working", "shower not working", "sewer blockage",
-                "fix the cistern", "kitchen sink leaking", "water meter leaking"],
-    "electrician": ["electrical wiring", "fix the power", "install sockets",
-                    "rewire the house", "circuit breaker tripping", "solar installation",
-                    "no electricity", "fix the lights", "install security lights",
-                    "power keeps going off", "fix the electricity meter",
-                    "install ceiling fan", "wiring fault", "install water heater wiring"],
-    "mason": ["build a wall", "plastering", "bricklaying", "lay foundation",
-              "concrete slab", "perimeter wall", "construction work", "fix the roof",
-              "leaking roof", "roof repair", "waterproof the roof", "ceiling leaking",
-              "fix cracked wall", "tiling the floor", "cabro paving", "septic tank",
-              "concrete roof leaking"],
-    "painter": ["paint the house", "repaint walls", "wall finishing", "exterior painting",
-                "waterproof coating", "decorate the room", "paint the gate",
-                "ceiling painting", "skim coat the walls", "repaint the office"],
-    "welder": ["weld a gate", "make window grills", "metal fabrication", "steel door",
-               "repair the gate", "fabricate a staircase", "mabati roofing",
-               "iron sheet roof leaking", "fix the gate hinge", "make a metal door",
-               "welding the fence", "fix the mabati roof"],
-    "carpenter": ["make furniture", "fix the door", "build cabinets", "wood finishing",
-                  "kitchen cabinets", "repair the wardrobe", "roof timber", "roof trusses",
-                  "fix the ceiling boards", "install gypsum ceiling", "make a bed",
-                  "fix wooden floor", "fit the door frame", "wooden roof leaking"],
-    "cleaner": ["house cleaning", "deep clean", "office cleaning", "laundry and ironing",
-                "post construction cleaning", "fumigation", "sofa cleaning",
-                "carpet cleaning", "move out cleaning", "garden cleaning"],
-    "driver": ["need a driver", "delivery within town", "school run", "airport pickup",
-               "moving house items", "transport goods", "personal driver",
-               "pick up luggage", "moving to a new house"],
+                "fix my shower head", "shower not working", "no water", "toilet repair"],
+    "electrician": ["electrical wiring", "fix the power", "install sockets", "rewire the house",
+                    "fix my electrical appliances", "lights keep tripping", "no electricity"],
+    "mason": ["build a wall", "plastering", "bricklaying", "lay foundation", "tiling the floor"],
+    "painter": ["paint the house", "repaint walls", "exterior painting", "ceiling painting"],
+    "welder": ["weld a gate", "make window grills", "metal fabrication", "fix the mabati roof"],
+    "carpenter": ["make furniture", "fix the door", "build cabinets", "kitchen cabinets"],
+    "cleaner": ["house cleaning", "deep clean", "office cleaning", "fumigation"],
+    "driver": ["need a driver", "delivery within town", "airport pickup", "transport goods"],
 }
 
 # ---------------------------------------------------------------- tunables
-# These are calibrated against the LinearSVC margin scale. Inspect the `gap` and
-# `ranked` scores from a few real requests and nudge if needed.
-ALT_MARGIN = 0.8      # a runner-up only counts as an alternative if within this of the top score
-AMBIGUITY_GAP = 0.8   # below this top-vs-2nd margin gap we treat the prediction as ambiguous
-ALT_PROBA_MARGIN = 0.15  # used instead when the model exposes predict_proba (probabilities)
+PRIMARY_THRESHOLD = 0.45   # a trade is "matched" if its calibrated probability >= this
+CO_TRADE_THRESHOLD = 0.40  # a secondary trade is surfaced as an alternative if >= this
+# legacy (bare LinearSVC) closeness controls
+ALT_MARGIN = 0.8
+AMBIGUITY_GAP = 0.8
 
 _MODEL = None
 
@@ -85,26 +61,38 @@ def _clean(t: str) -> str:
 
 
 def _train_fallback():
+    """Tiny multi-label fallback if no artifact is present (keeps the service alive)."""
+    from sklearn.calibration import CalibratedClassifierCV
     from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.multiclass import OneVsRestClassifier
     from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import MultiLabelBinarizer
     from sklearn.svm import LinearSVC
+
     locs = ["Kasarani", "Umoja", "Westlands", "Embakasi", "Kibera", "Donholm"]
-    times = ["tomorrow morning", "this weekend", "today", "next week", "urgently"]
     rng = random.Random(42)
-    X, y = [], []
+    trades = list(TRADE_VOCAB)
+    X, Y = [], []
     for trade, phrases in TRADE_VOCAB.items():
-        for _ in range(180):
-            p, loc, t = rng.choice(phrases), rng.choice(locs), rng.choice(times)
-            post = rng.choice([f"Need a {trade} in {loc} to {p} {t}.",
-                               f"Looking for someone to {p} in {loc} {t}.",
-                               f"{p} {t} in {loc}, who can help?",
-                               f"my {p} please come to {loc} {t}"])
-            X.append(_clean(post)); y.append(trade)
+        for _ in range(120):
+            p, loc = rng.choice(phrases), rng.choice(locs)
+            X.append(_clean(rng.choice([f"need someone to {p} in {loc}",
+                                        f"{p} in {loc} who can help", f"please {p}"])))
+            Y.append([trade])
+    for _ in range(400):
+        ta, tb = rng.sample(trades, 2)
+        pa, pb = rng.choice(TRADE_VOCAB[ta]), rng.choice(TRADE_VOCAB[tb])
+        X.append(_clean(f"need someone to {pa} and also {pb}"))
+        Y.append([ta, tb])
+
+    mlb = MultiLabelBinarizer()
+    Ybin = mlb.fit_transform(Y)
     pipe = Pipeline([("tfidf", TfidfVectorizer(ngram_range=(1, 2), min_df=2,
                                                sublinear_tf=True, stop_words="english")),
-                     ("clf", LinearSVC(class_weight="balanced"))])
-    pipe.fit(X, y)
-    return pipe
+                     ("clf", OneVsRestClassifier(CalibratedClassifierCV(
+                         LinearSVC(class_weight="balanced"), cv=3)))])
+    pipe.fit(X, Ybin)
+    return {"pipeline": pipe, "labels": list(mlb.classes_), "multilabel": True}
 
 
 def _load_model():
@@ -112,55 +100,50 @@ def _load_model():
     if _MODEL is not None:
         return _MODEL
     path = os.environ.get("TRADE_MODEL_PATH", "trade_classifier.joblib")
-    if os.path.exists(path):
-        _MODEL = joblib.load(path)
-    else:
-        _MODEL = _train_fallback()
+    _MODEL = joblib.load(path) if os.path.exists(path) else _train_fallback()
     return _MODEL
 
 
-def _class_labels(model):
-    """Class labels whether the final step is a bare or calibrated classifier."""
-    try:
-        return model.named_steps["clf"].classes_
-    except (KeyError, AttributeError):
-        return model.classes_
+def _predict_multilabel(artifact, cleaned):
+    pipe, labels = artifact["pipeline"], artifact["labels"]
+    proba = np.asarray(pipe.predict_proba([cleaned])[0], dtype=float)
+    order = np.argsort(proba)[::-1]
+    ranked = [{"trade": str(labels[i]), "score": round(float(proba[i]), 3)} for i in order]
+
+    primary = str(labels[order[0]])
+    top = float(proba[order[0]])
+    # all trades clearly matched (multi-trade requests light up >1)
+    matched = [str(labels[i]) for i in order if float(proba[i]) >= PRIMARY_THRESHOLD]
+    if not matched:
+        matched = [primary]
+    # co-trades = matched trades other than the primary, or near-miss runners-up
+    alternatives = [t for t in matched if t != primary]
+    if not alternatives and len(order) > 1 and float(proba[order[1]]) >= CO_TRADE_THRESHOLD:
+        alternatives = [str(labels[order[1]])]
+
+    ambiguous = bool(len(alternatives) > 0)
+    return {"trade": primary, "trades": matched, "confidence": round(top, 3),
+            "ambiguous": ambiguous, "alternatives": alternatives[:2], "ranked": ranked}
 
 
-def _score(model, cleaned):
-    """Return (labels, order, confidence, ranked, alternatives, gap).
-
-    Uses real probabilities when available (predict_proba), otherwise a softmax over
-    the LinearSVC decision-function margins. Alternatives are only included when they
-    are genuinely close to the top prediction.
-    """
-    labels = _class_labels(model)
-
-    if hasattr(model, "predict_proba"):
-        probs = np.asarray(model.predict_proba([cleaned])[0], dtype=float)
-        order = np.argsort(probs)[::-1]
-        conf = float(probs[order[0]])
-        ranked = [{"trade": str(labels[i]), "score": round(float(probs[i]), 3)} for i in order]
-        top = float(probs[order[0]])
-        gap = top - (float(probs[order[1]]) if len(order) > 1 else 0.0)
-        alternatives = [str(labels[i]) for i in order[1:]
-                        if (top - float(probs[i])) <= ALT_PROBA_MARGIN][:1]
-        return labels, order, conf, ranked, alternatives, gap
-
-    # bare LinearSVC: raw margins
+def _predict_legacy(model, cleaned):
+    pred = str(model.predict([cleaned])[0])
     scores = np.asarray(model.decision_function([cleaned])[0], dtype=float)
+    try:
+        labels = model.named_steps["clf"].classes_
+    except (KeyError, AttributeError):
+        labels = model.classes_
     order = np.argsort(scores)[::-1]
     top = float(scores[order[0]])
-    second = float(scores[order[1]]) if len(order) > 1 else top - 99.0
-    gap = top - second
-    # softmax over margins -> relative, well-behaved confidence
+    gap = top - (float(scores[order[1]]) if len(order) > 1 else top - 99.0)
     exp = np.exp(scores - np.max(scores))
     probs = exp / exp.sum()
     conf = float(probs[order[0]])
     ranked = [{"trade": str(labels[i]), "score": round(float(scores[i]), 3)} for i in order]
-    alternatives = [str(labels[i]) for i in order[1:]
-                    if (top - float(scores[i])) <= ALT_MARGIN][:1]
-    return labels, order, conf, ranked, alternatives, gap
+    alternatives = [str(labels[i]) for i in order[1:] if (top - float(scores[i])) <= ALT_MARGIN][:1]
+    ambiguous = bool(gap < AMBIGUITY_GAP and len(alternatives) > 0)
+    return {"trade": pred, "trades": [pred] + alternatives, "confidence": round(conf, 3),
+            "ambiguous": ambiguous, "alternatives": alternatives, "ranked": ranked}
 
 
 # ---------------------------------------------------------------- API
@@ -168,8 +151,7 @@ class PredictIn(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
 
 
-app = FastAPI(title="Kazi Connect Model Service", version="1.1.0")
-
+app = FastAPI(title="Kazi Connect Model Service", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in os.environ.get(
@@ -185,27 +167,18 @@ def _warm():
 
 @app.get("/health")
 def health():
-    using_artifact = os.path.exists(os.environ.get("TRADE_MODEL_PATH",
-                                                    "trade_classifier.joblib"))
-    return {"status": "ok", "model": "artifact" if using_artifact else "synthetic-fallback"}
+    art = _load_model()
+    multilabel = isinstance(art, dict) and art.get("multilabel")
+    using_artifact = os.path.exists(os.environ.get("TRADE_MODEL_PATH", "trade_classifier.joblib"))
+    return {"status": "ok",
+            "model": "artifact" if using_artifact else "synthetic-fallback",
+            "mode": "multi-label" if multilabel else "single-label"}
 
 
 @app.post("/predict-trade")
 def predict_trade(payload: PredictIn):
-    model = _load_model()
+    art = _load_model()
     cleaned = _clean(payload.text)
-    pred = str(model.predict([cleaned])[0])
-
-    labels, order, conf, ranked, alternatives, gap = _score(model, cleaned)
-
-    # Ambiguous only when the top two are close AND a genuine alternative exists.
-    ambiguous = bool(gap < AMBIGUITY_GAP and len(alternatives) > 0)
-
-    return {
-        "trade": pred,
-        "confidence": round(conf, 3),
-        "ambiguous": ambiguous,
-        "gap": round(gap, 3),
-        "alternatives": alternatives,
-        "ranked": ranked,
-    }
+    if isinstance(art, dict) and art.get("multilabel"):
+        return _predict_multilabel(art, cleaned)
+    return _predict_legacy(art, cleaned)
